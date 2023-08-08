@@ -26,32 +26,6 @@ generate_tarfile_contenthash() {
 }
 
 
-# Compare two tar files to check if contents are similar
-# Currrently not used
-check_tar_diff() {
-  file1="$1"
-  file2="$2"
-
-  TEMP_EXTRACTION_FOLDER=/tmp/extracted
-  mkdir -p $TEMP_EXTRACTION_FOLDER/file1
-  mkdir -p $TEMP_EXTRACTION_FOLDER/file2
-
-  #Extract the first file
-  if eval /bin/tar -xf "$file1" -C "$TEMP_EXTRACTION_FOLDER/file1"; then
-    #Extract the second file
-    if eval /bin/tar -xf "$file2" -C "$TEMP_EXTRACTION_FOLDER/file2"; then      
-      if eval diff -r "$TEMP_EXTRACTION_FOLDER/file1" "$TEMP_EXTRACTION_FOLDER/file2" > /dev/null; then 
-        echo "0"
-      else
-        echo "1"
-      fi
-    fi
-  fi
-
-  rm -rf $TEMP_EXTRACTION_FOLDER
-}
-
-
 # Initialize variables
 init() {
   if [ "$TIMESTAMP" = true ]; then
@@ -120,28 +94,25 @@ backup() {
   fi
 
   # If DEDUPE is enabled, check if there are any changes from the previous and current backup files
-  if [ "$BACKUP_USE_DEDUPE" = true ]; then 
-    debug "Dedupe switch detected.  Checking for duplicate files"
+  if [ "$BACKUP_USE_DEDUPE" = true ]; then
+    debug "Dedupe switch detected.  Checking for previous backups."
     # Find the latest previous backup file
-    #previous_backup_file="$(find "${BACKUP_DIR}" -type f -name "${backup_file_searchstring}" -printf  "%T@ %p\n"  | sort -n | cut -d' ' -f 2- | tail -n 1)"
     previous_backup_file="$(find "${BACKUP_DIR}" -type f -name "${backup_file_searchstring}" -print0 | xargs -0 ls -tr | tail -n 1)"
     previous_backup_hashcheck_file="$BACKUP_DIR/$(basename "${previous_backup_file}").hash"
 
     # Only proceed if previous backup and hashcheck files exist
     if [ -f "$previous_backup_file" ] && [ -f "$previous_backup_hashcheck_file" ]; then
       debug "Previous backup and corresponding hascheck file detected"
-      debug "Using previous backup: $previous_backup_file"
+      debug "Evaluating previous backup: $previous_backup_file"
       # Generate a filehash of the tar file for comparison
       previous_backup_tarhash="$(sha256sum $previous_backup_file | awk '{print $1}')"
 
       # Extract the previous tar filehash (1st line)
       extracted_tarhash="$(head -n 1 $previous_backup_hashcheck_file)"
-      debug "Previous backup tarhash: $previous_backup_tarhash"
-      debug "Expected backup tarhash: $extracted_tarhash"
 
       # Ensure the hash of the latest backup file matches the extracted tarhash!
       if [ "$extracted_tarhash" = "$previous_backup_tarhash" ]; then
-        debug "Previous backup matches stored hash.  Checking contents"
+        debug "Previous backup matches expected hash.  Checking contents"
         # Extract the 2nd line of the hasheck file (line 2)
         extracted_contenthash="$(sed -n '2p' < $previous_backup_hashcheck_file)"
 
@@ -189,7 +160,7 @@ backup() {
     else
       # If the latest backup is UNCHANGED form the previous backup and dedupe is enabled, copy previous backup file.
       debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
-      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+      if eval cp "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
         touch -a -m "$BACKUP_FILE_ARCHIVE"
         info "Successfully copied previous backup"
       else
@@ -227,7 +198,7 @@ backup() {
     else
       # If the latest backup is UNCHANGED form the previous backup and dedupe is enabled, copy previous backup file.
       debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
-      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+      if eval cp "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
         touch -a -m "$BACKUP_FILE_ARCHIVE"
         info "Successfully copied previous backup"
       else
@@ -242,7 +213,7 @@ backup() {
     # If DEDUPE is enabled, a previous backup exists, and the contents have NOT changed, then copy the previous backup 
     if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ "$create_new_backup" = false ]; then
       debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
-      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+      if eval cp "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
         touch -a -m "$BACKUP_FILE_ARCHIVE"
         info "Successfully copied previous backup"
       else
@@ -250,7 +221,7 @@ backup() {
       fi
     else
       debug "Changes detected since last backup.  Creating new backup file."
-      if eval mv "$TEMP_BACKUP_ARCHIVE" "$BACKUP_FILE_ARCHIVE"; then
+      if eval cp "$TEMP_BACKUP_ARCHIVE" "$BACKUP_FILE_ARCHIVE"; then
         touch -a -m "$BACKUP_FILE_ARCHIVE"
         info "Successfully created  backup"
       else
