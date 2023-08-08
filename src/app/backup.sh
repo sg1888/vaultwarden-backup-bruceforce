@@ -7,7 +7,50 @@
 : "${warning_counter:=0}"
 : "${error_counter:=0}"
 
+
 ### Functions ###
+# Generate a single SHA256 hash of the contents of a tar file
+generate_tarfile_contenthash() {
+  source_file="$1"
+  TEMP_EXTRACTION_FOLDER=/tmp/extracted
+
+  mkdir -p $TEMP_EXTRACTION_FOLDER
+  # Generate hash
+  if eval /bin/tar -xf "$source_file" -C "$TEMP_EXTRACTION_FOLDER"; then
+    result="$(find $TEMP_EXTRACTION_FOLDER -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+    echo "$result"
+  else
+    debug "Successfully created backup $BACKUP_FILE_ARCHIVE"
+  fi
+  rm -rf "$TEMP_EXTRACTION_FOLDER"
+}
+
+
+# Compare two tar files to check if contents are similar
+# Currrently not used
+check_tar_diff() {
+  file1="$1"
+  file2="$2"
+
+  TEMP_EXTRACTION_FOLDER=/tmp/extracted
+  mkdir -p $TEMP_EXTRACTION_FOLDER/file1
+  mkdir -p $TEMP_EXTRACTION_FOLDER/file2
+
+  #Extract the first file
+  if eval /bin/tar -xf "$file1" -C "$TEMP_EXTRACTION_FOLDER/file1"; then
+    #Extract the second file
+    if eval /bin/tar -xf "$file2" -C "$TEMP_EXTRACTION_FOLDER/file2"; then      
+      if eval diff -r "$TEMP_EXTRACTION_FOLDER/file1" "$TEMP_EXTRACTION_FOLDER/file2" > /dev/null; then 
+        echo "0"
+      else
+        echo "1"
+      fi
+    fi
+  fi
+
+  rm -rf $TEMP_EXTRACTION_FOLDER
+}
+
 
 # Initialize variables
 init() {
@@ -15,6 +58,7 @@ init() {
     TIMESTAMP_PREFIX="$(date "+%F-%H%M%S")_"
   fi
 
+  TEMP_BACKUP_ARCHIVE="/tmp/temp-backup.tar.xz"
   BACKUP_FILE_DB=/tmp/db.sqlite3
   BACKUP_FILE_ARCHIVE="$BACKUP_DIR/${TIMESTAMP_PREFIX}backup.tar.xz"
 
@@ -30,6 +74,9 @@ backup() {
   # First we backup the database to a temporary file (this will later be added to a tar archive)
   if [ "$BACKUP_ADD_DATABASE" = true ] && /usr/bin/sqlite3 "$VW_DATABASE_URL" ".backup '$BACKUP_FILE_DB'"; then
     tar_file_params="$tar_file_params -C $(dirname "$(readlink -f $BACKUP_FILE_DB)") $(basename $BACKUP_FILE_DB)"
+    # Mirror timestamp of source database
+    touch "$BACKUP_FILE_DB" -r "$VW_DATABASE_URL"
+
     debug "Written temporary backup file to $BACKUP_FILE_DB"
     debug "Current tar command: $tar_file_params"
   else
@@ -51,36 +98,188 @@ backup() {
 
   debug "Current tar command: /bin/tar -cJf $BACKUP_FILE_ARCHIVE $tar_file_params"
 
+  # Placeholders
+  create_new_backup=true           # By default, create a new backup
+  latest_backup_contenthash=""
+  previous_backup_file=""
+  previous_backup_hashcheck_file=""
+  backup_file_searchstring="*backup.tar.xz"    # search for previous backup files matching these patterns
+
+  # Create a temporary unencrypted backup file
+  if eval /bin/tar -cJf "$TEMP_BACKUP_ARCHIVE" "$tar_file_params"; then
+    # Generate a filehash of the backup for future comparison
+    latest_backup_contenthash="$(generate_tarfile_contenthash $TEMP_BACKUP_ARCHIVE)"
+  else
+    error "Backup failed"
+  fi
+
+  # Get the name of the previous backup file and set the backup filename for encrypted files 
+  if [ -f "$ENCRYPTION_GPG_KEYFILE_LOCATION" ] || [ ! "$ENCRYPTION_PASSWORD" = false ]; then
+    backup_file_searchstring="${backup_file_searchstring}.gpg"
+    BACKUP_FILE_ARCHIVE="$BACKUP_FILE_ARCHIVE.gpg"
+  fi
+
+  # If DEDUPE is enabled, check if there are any changes from the previous and current backup files
+  if [ "$BACKUP_USE_DEDUPE" = true ]; then 
+    debug "Dedupe switch detected.  Checking for duplicate files"
+    # Find the latest previous backup file
+    #previous_backup_file="$(find "${BACKUP_DIR}" -type f -name "${backup_file_searchstring}" -printf  "%T@ %p\n"  | sort -n | cut -d' ' -f 2- | tail -n 1)"
+    previous_backup_file="$(find "${BACKUP_DIR}" -type f -name "${backup_file_searchstring}" -print0 | xargs -0 ls -tr | tail -n 1)"
+    previous_backup_hashcheck_file="$BACKUP_DIR/$(basename "${previous_backup_file}").hash"
+
+    # Only proceed if previous backup and hashcheck files exist
+    if [ -f "$previous_backup_file" ] && [ -f "$previous_backup_hashcheck_file" ]; then
+      debug "Previous backup and corresponding hascheck file detected"
+      debug "Using previous backup: $previous_backup_file"
+      # Generate a filehash of the tar file for comparison
+      previous_backup_tarhash="$(sha256sum $previous_backup_file | awk '{print $1}')"
+
+      # Extract the previous tar filehash (1st line)
+      extracted_tarhash="$(head -n 1 $previous_backup_hashcheck_file)"
+      debug "Previous backup tarhash: $previous_backup_tarhash"
+      debug "Expected backup tarhash: $extracted_tarhash"
+
+      # Ensure the hash of the latest backup file matches the extracted tarhash!
+      if [ "$extracted_tarhash" = "$previous_backup_tarhash" ]; then
+        debug "Previous backup matches stored hash.  Checking contents"
+        # Extract the 2nd line of the hasheck file (line 2)
+        extracted_contenthash="$(sed -n '2p' < $previous_backup_hashcheck_file)"
+
+        # Check if the content of the latest backup file matches the previous backup!
+        if [ $extracted_contenthash = $latest_backup_contenthash ]; then
+          debug "Tar contents match.  No changes detected since last backup"
+          create_new_backup=false
+        fi
+      fi
+    fi
+  fi
+
+
   # Here we create the backup tar archive with optional encryption
   if [ "$ENCRYPTION_BASE64_GPG_KEY" != false ] && [ "$ENCRYPTION_PASSWORD" != false ]; then
     warn "Ignoring ENCRYPTION_PASSWORD since you set both ENCRYPTION_BASE64_GPG_KEY and ENCRYPTION_PASSWORD."
   fi
 
   if [ -f "$ENCRYPTION_GPG_KEYFILE_LOCATION" ]; then
-    # Create a backup with public key encryption
-    if eval /bin/tar -cJ "$tar_file_params" | gpg --batch --no-options --no-tty --yes --encrypt \
-        --recipient-file "$ENCRYPTION_GPG_KEYFILE_LOCATION" -o "$BACKUP_FILE_ARCHIVE.gpg"; then
-      info "Successfully created gpg (public key) encrypted backup $BACKUP_FILE_ARCHIVE.gpg"
-    else
-      error "Encrypted backup failed!"
+    debug "Encrypting using GPG Keyfile"
+
+    # If DEDUPE is enabled and previous backup exists, check if the key has changed
+    if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ "$create_new_backup" = false ]; then
+      debug "Previous backup detected.  Checking to see if the key has changed"
+      # Get KeyID of current GPG Keyfile
+      current_keyID="$(gpg --with-colons "$ENCRYPTION_GPG_KEYFILE_LOCATION" 2>&1 | awk -F':' '/sub/{ print $5 }')"
+
+      # Get public KeyID of previous backup
+      previous_keyID="$(gpg --pinentry-mode cancel --list-packets "$previous_backup_file" 2>&1 | sed -n 's/.*:pubkey\s.*\skeyid \(.*\)$/\1/p')"
+
+      # Check if the public keys match.  If not, create a new backup 
+      if [ "$current_keyID" != "$previous_keyID" ]; then create_new_backup=true; fi
     fi
+
+    #Check if create new backup flag is enabled or dedupe is disabled
+    if [ "$create_new_backup" = true ] || [ "$BACKUP_USE_DEDUPE" = false ]; then
+      debug "Creating new backup file"
+      # Create a backup with public key encryption
+      if eval gpg --batch --no-options --no-tty --yes --recipient-file "$ENCRYPTION_GPG_KEYFILE_LOCATION"\
+          -o "$BACKUP_FILE_ARCHIVE" --encrypt "$TEMP_BACKUP_ARCHIVE"; then
+        info "Successfully created gpg (public key) encrypted backup $BACKUP_FILE_ARCHIVE"
+      else
+        error "Encrypted backup failed!"
+      fi
+    else
+      # If the latest backup is UNCHANGED form the previous backup and dedupe is enabled, copy previous backup file.
+      debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
+      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+        touch -a -m "$BACKUP_FILE_ARCHIVE"
+        info "Successfully copied previous backup"
+      else
+        error "Failed to copy previous backup!"
+      fi
+    fi
+
   elif [ ! "$ENCRYPTION_PASSWORD" = false ]; then
-    # Create a backup with symmetric encryption
-    if eval /bin/tar -cJ "$tar_file_params" | gpg --batch --no-options --no-tty --yes --symmetric \
-        --passphrase "$ENCRYPTION_PASSWORD" --cipher-algo "$ENCRYPTION_ALGORITHM" -o "$BACKUP_FILE_ARCHIVE.gpg"; then
-      info " Successfully created gpg (password) encrypted backup $BACKUP_FILE_ARCHIVE.gpg"
-    else
-      error "Encrypted backup failed!"
+    debug "Creating backup using passphrase"
+
+    # If DEDUPE is enabled and a previous backup exists, check if the key has changed
+    if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ "$create_new_backup" = false ]; then
+      debug "Previous backup detected.  Checking to see if the passphrase has changed"
+
+      # Attempt to decrypt previous backup with current key
+      if gpg --decrypt --batch --dry-run --output /dev/null --passphrase "$ENCRYPTION_PASSWORD" "$previous_backup_file"; then
+        # Previous backup key is correct
+        debug "Passphrase is unchanged."
+      else
+        debug "Passphrase has changed since the last backup!  A new backup will be created"
+        create_new_backup=true
+      fi
     fi
+
+    #Check if content has changed and dedupe is enabled
+    if [ "$create_new_backup" = true ] || [ "$BACKUP_USE_DEDUPE" = false ]; then
+      # Create a backup with symmetric encryption
+      debug "Creating backup with symmetric encryption"
+      if gpg --batch --no-options --no-tty --yes --symmetric --passphrase "$ENCRYPTION_PASSWORD" \
+           --cipher-algo "$ENCRYPTION_ALGORITHM" -o "$BACKUP_FILE_ARCHIVE" "$TEMP_BACKUP_ARCHIVE"; then
+        info "Successfully created gpg (password) encrypted backup $BACKUP_FILE_ARCHIVE"
+      else
+        error "Encrypted backup failed!"
+      fi
+    else
+      # If the latest backup is UNCHANGED form the previous backup and dedupe is enabled, copy previous backup file.
+      debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
+      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+        touch -a -m "$BACKUP_FILE_ARCHIVE"
+        info "Successfully copied previous backup"
+      else
+        error "Failed to copy previous backup!"
+      fi
+    fi
+
   else
     # Create a backup without encryption
-    if eval /bin/tar -cJf "$BACKUP_FILE_ARCHIVE" "$tar_file_params"; then
-      info "Successfully created backup $BACKUP_FILE_ARCHIVE"
+    debug "Creating backup without encryption"
+
+    # If DEDUPE is enabled, a previous backup exists, and the contents have NOT changed, then copy the previous backup 
+    if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ create_new_backup = false ]; then
+      debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
+      if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
+        touch -a -m "$BACKUP_FILE_ARCHIVE"
+        info "Successfully copied previous backup"
+      else
+        error "Failed to copy previous backup!"
+      fi
     else
-      error "Backup failed"
+      debug "Changes detected since last backup.  Creating new backup file."
+      if eval mv "$TEMP_BACKUP_ARCHIVE" "$BACKUP_FILE_ARCHIVE"; then
+        touch -a -m "$BACKUP_FILE_ARCHIVE"
+        info "Successfully created  backup"
+      else
+        error "Failed to create backup!"
+      fi
     fi
   fi
+
+  # Remove temporary files and old
   rm "$BACKUP_FILE_DB"
+  rm "$previous_backup_hashcheck_file"
+  rm "$TEMP_BACKUP_ARCHIVE"
+
+
+  # Generate a new hash check file If dedupe is enabled
+  if [ "$BACKUP_USE_DEDUPE" = true ]; then
+    debug "Generating new backup hashcheck file"
+
+    LATEST_BACKUP_HASHCHECK_FILE="$BACKUP_FILE_ARCHIVE.hash"
+    touch "$LATEST_BACKUP_HASHCHECK_FILE"
+
+    # Calculate the current backup
+    latest_backup_tarhash="$(sha256sum $BACKUP_FILE_ARCHIVE | awk '{print $1}')"
+
+    # Copy the latest hash data
+    echo "$latest_backup_tarhash" >> "$LATEST_BACKUP_HASHCHECK_FILE"
+    echo "$latest_backup_contenthash" >> "$LATEST_BACKUP_HASHCHECK_FILE"
+  fi
+
 }
 
 # Performs a healthcheck
