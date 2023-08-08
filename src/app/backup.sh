@@ -143,7 +143,7 @@ backup() {
       # Get public KeyID of previous backup
       previous_keyID="$(gpg --pinentry-mode cancel --list-packets "$previous_backup_file" 2>&1 | sed -n 's/.*:pubkey\s.*\skeyid \(.*\)$/\1/p')"
 
-      # Check if the public keys match.  If not, create a new backup 
+      # Check if the key IDs  match.  If not, create a new backup.
       if [ "$current_keyID" != "$previous_keyID" ]; then create_new_backup=true; fi
     fi
 
