@@ -240,7 +240,7 @@ backup() {
     debug "Creating backup without encryption"
 
     # If DEDUPE is enabled, a previous backup exists, and the contents have NOT changed, then copy the previous backup 
-    if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ create_new_backup = false ]; then
+    if [ "$BACKUP_USE_DEDUPE" = true ] && [ -f "$previous_backup_file" ] && [ "$create_new_backup" = false ]; then
       debug "No changes detected since last backup. Dedupe enabled.  Copying previous backup."
       if eval mv "$previous_backup_file" "$BACKUP_FILE_ARCHIVE"; then
         touch -a -m "$BACKUP_FILE_ARCHIVE"
